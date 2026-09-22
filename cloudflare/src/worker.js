@@ -194,8 +194,12 @@ export default {
             { headers: { 'Cache-Control': 'no-store' } });
         }
         if (typeof input.sql !== 'string' || !input.sql.trim()) return Response.json({ error: 'sql must be nonempty text' }, { status: 400 });
+        const started = performance.now();
         const result = await stub.query(input.sql, input.failBeforeCommit === true);
-        return Response.json(result, { headers: { 'Cache-Control': 'no-store' } });
+        // The RPC is a real I/O boundary. Timers inside the synchronous WASM
+        // engine can be stale/frozen, so do not display that duration as latency.
+        return Response.json({ ...result, elapsedMs: performance.now() - started,
+          timingScope: 'worker-do-rpc' }, { headers: { 'Cache-Control': 'no-store' } });
       } catch (error) {
         return Response.json({ error: error.message }, { status: 500 });
       }

@@ -83,6 +83,37 @@ Reports are saved in the ignored `test-results/` directory. These checks
 are a small integration suite, not PostgreSQL conformance certification,
 load testing, or a comprehensive crash-consistency proof.
 
+## Compare with native SQLite
+
+```sh
+pnpm benchmark
+TEST_URL=https://pgrust.thecomputerplumbers.com pnpm benchmark
+```
+
+This prepares 1,000 identical rows in pgrust and native SQLite in the
+**same Durable Object**, then checks and times `SELECT 1`, a primary-key
+lookup, a sum over 1,000 rows, an update returning its value, and 100
+batched constant queries. Each scenario has three warmups and 20 measured
+requests per engine, with alternating engine order. Set
+`BENCHMARK_SAMPLES` to change the sample count (5–100).
+
+Fixture setup and warmups are excluded. Both paths await storage durability
+before returning. The native path executes fixed benchmark SQL directly
+through `ctx.storage.sql`; it is not D1 or a second WASM SQLite engine.
+`rpcMs` measures the Worker-to-DO round trip, including routing, queueing,
+execution, result conversion, and durability. `roundTripMs` also includes
+client networking, authentication, and response transfer.
+
+`localStageMs` separates metadata loading, instantiation, the engine plus
+filesystem work, metadata flushing/result formatting, and durability in
+**local workerd only**. Do not interpret the deployed stage values as CPU
+timings: [Cloudflare freezes timers during synchronous execution](https://developers.cloudflare.com/workers/runtime-apis/performance/).
+The benchmark uses RPC boundaries for the live comparison instead.
+
+The authenticated benchmark endpoints operate only on fixed SQL and the
+reserved `__cf_benchmark_rows` fixture. Each script run uses its own named
+DO by default. No existing playground tables are altered.
+
 ## Deploy
 
 Verify `pnpm exec wrangler whoami` and the explicit account in

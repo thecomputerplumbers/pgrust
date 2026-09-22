@@ -43,7 +43,7 @@ $('run').onclick = () => busy(async () => {
   const result = await api('query', { sql: $('sql').value });
   $('output').textContent = result.output || (result.ok ? 'Completed.' : result.diagnostics);
   $('diagnostics').textContent = result.diagnostics;
-  $('metrics').textContent = `${result.elapsedMs} ms · ${(result.memoryBytes/1048576).toFixed(1)} MiB WASM · boot ${result.bootId.slice(0,8)}`;
+  $('metrics').textContent = `${result.elapsedMs} ms server round trip · ${(result.memoryBytes/1048576).toFixed(1)} MiB WASM · boot ${result.bootId.slice(0,8)}`;
   if (!result.ok) $('output').classList.add('error');
 });
 $('restart').onclick = () => busy(async () => {

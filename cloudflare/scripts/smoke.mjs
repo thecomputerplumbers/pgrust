@@ -16,10 +16,14 @@ async function call(action, body, db = database) {
   return { status: response.status, ...data };
 }
 async function query(sql) {
+  const started = performance.now();
   const result = await call('query', { sql });
+  const roundTripMs = performance.now() - started;
   assert.equal(result.status, 200, JSON.stringify(result));
   assert.equal(result.ok, true, result.diagnostics);
   assert(result.memoryBytes < 100 * 1048576, 'WASM memory headroom');
+  assert.equal(result.timingScope, 'worker-do-rpc');
+  assert(result.elapsedMs >= 0 && result.elapsedMs <= roundTripMs + 5, 'Displayed latency must fit within the HTTP round trip (5ms timer tolerance)');
   results.push({ sql, elapsedMs: result.elapsedMs, memoryBytes: result.memoryBytes, bootId: result.bootId });
   return result;
 }
