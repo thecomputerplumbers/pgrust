@@ -58,6 +58,13 @@ const isolated = await call('query', { sql: "SELECT count(*) AS total FROM infor
 assert.equal(isolated.ok, true, JSON.stringify(isolated));
 assert.match(isolated.raw, /total = "0"/);
 console.log('PASS separate object has independent database');
+const crossObject = await Promise.all([database, `${database}-other`].map(db =>
+  call('query', { sql: 'SELECT 42 AS answer;' }, db)));
+for (const result of crossObject) {
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.match(result.raw, /answer = "42"/);
+}
+console.log('PASS concurrent queries across separate objects');
 const parallel = await Promise.all(Array.from({ length: 5 }, (_, i) => query(`INSERT INTO probe VALUES (${10+i}, 'parallel');`)));
 assert.equal(parallel.length, 5);
 const counted = await query('SELECT count(*) AS total FROM probe;');

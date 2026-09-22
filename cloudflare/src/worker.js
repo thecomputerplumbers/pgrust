@@ -51,42 +51,47 @@ export class PgRustDatabase extends DurableObject {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.initialize();
       const started = performance.now();
-      const vfs = new SqliteVfs(this.ctx.storage.sql);
-      const outputChunks = [], diagnosticChunks = [];
-      let stdout = '', stderr = '', outputBytes = 0;
-      const sink = (kind) => (bytes) => {
-        outputBytes += bytes.length;
-        if (outputBytes > 131072) throw new Error('Query output exceeds 128 KiB limit');
-        (kind === 'out' ? outputChunks : diagnosticChunks).push(bytes);
-      };
-      const host = makeWasi({ vfs, argv, stdinBytes: normalizeSingleUserInput(input),
-        onStdout: sink('out'), onStderr: sink('err') });
-      // A precompiled module is imported by Wrangler; no runtime compilation.
-      const instance = new WebAssembly.Instance(postgres, { wasi_snapshot_preview1: host.wasi });
-      host.setMemory(instance.exports.memory);
-      let stats;
-      this.ctx.storage.transactionSync(() => {
-        try { instance.exports._start(); }
-        catch (error) {
-          if (!(error instanceof GuestExit && error.code === 0)) throw error;
-        }
-        stdout = decodeUtf8Chunks(outputChunks);
-        stderr = decodeUtf8Chunks(diagnosticChunks);
-        if (/\b(?:FATAL|PANIC):/.test(stderr)) throw new Error(stderr.slice(-4096));
-        stats = vfs.flush();
-        if (failBeforeCommit) throw new Error('Injected failure before durable commit');
-      });
-      // Do not acknowledge results before the DO storage commit is durable.
+      const result = this.execute(input, failBeforeCommit);
+      // execute() returns before awaiting durability, releasing every reference
+      // to the ~80 MiB WASM instance while another object may run in this isolate.
       await this.ctx.storage.sync();
-      return {
-        ok: !/\bERROR:/.test(stderr), output: stdout.split(/^backend> /m)
-          .filter(part => part.includes('(typeid =')).map(formatSingleUser).join('\n\n'), raw: stdout,
-        diagnostics: stderr, bootId: this.bootId,
-        memoryBytes: instance.exports.memory.buffer.byteLength,
-        elapsedMs: Math.round((performance.now() - started) * 100) / 100,
-        ...stats,
-      };
+      return { ...result, elapsedMs: Math.round((performance.now() - started) * 100) / 100 };
     });
+  }
+
+  execute(input, failBeforeCommit) {
+    const vfs = new SqliteVfs(this.ctx.storage.sql);
+    const outputChunks = [], diagnosticChunks = [];
+    let stdout = '', stderr = '', outputBytes = 0;
+    const sink = (kind) => (bytes) => {
+      outputBytes += bytes.length;
+      if (outputBytes > 131072) throw new Error('Query output exceeds 128 KiB limit');
+      (kind === 'out' ? outputChunks : diagnosticChunks).push(bytes);
+    };
+    const host = makeWasi({ vfs, argv, stdinBytes: normalizeSingleUserInput(input),
+      onStdout: sink('out'), onStderr: sink('err') });
+    // A precompiled module is imported by Wrangler; no runtime compilation.
+    const instance = new WebAssembly.Instance(postgres, { wasi_snapshot_preview1: host.wasi });
+    host.setMemory(instance.exports.memory);
+    let stats;
+    this.ctx.storage.transactionSync(() => {
+      try { instance.exports._start(); }
+      catch (error) {
+        if (!(error instanceof GuestExit && error.code === 0)) throw error;
+      }
+      stdout = decodeUtf8Chunks(outputChunks);
+      stderr = decodeUtf8Chunks(diagnosticChunks);
+      if (/\b(?:FATAL|PANIC):/.test(stderr)) throw new Error(stderr.slice(-4096));
+      stats = vfs.flush();
+      if (failBeforeCommit) throw new Error('Injected failure before durable commit');
+    });
+    return {
+      ok: !/\bERROR:/.test(stderr), output: stdout.split(/^backend> /m)
+        .filter(part => part.includes('(typeid =')).map(formatSingleUser).join('\n\n'), raw: stdout,
+      diagnostics: stderr, bootId: this.bootId,
+      memoryBytes: instance.exports.memory.buffer.byteLength,
+      ...stats,
+    };
   }
 
   status() {
