@@ -3,6 +3,7 @@ import postgres from '../generated/postgres.wasm';
 import { makeWasi, GuestExit } from '../../wasm/pgrust-wasi.js';
 import { normalizeSingleUserInput, formatSingleUser, decodeUtf8Chunks } from '../../wasm/format.js';
 import { SqliteVfs, createSchema, seedMetadata, PAGE_SIZE } from './sqlite-vfs.js';
+import { benchmarkSetup, benchmarkQueries } from './benchmark.js';
 
 const argv = ['postgres', '--single', '-D', '/pgdata',
   '-c', 'max_stack_depth=60000', '-c', 'io_method=sync', '-c', 'autovacuum=off',
@@ -60,7 +61,9 @@ export class PgRustDatabase extends DurableObject {
   }
 
   execute(input, failBeforeCommit) {
+    const started = performance.now();
     const vfs = new SqliteVfs(this.ctx.storage.sql);
+    const metadataLoaded = performance.now();
     const outputChunks = [], diagnosticChunks = [];
     let stdout = '', stderr = '', outputBytes = 0;
     const sink = (kind) => (bytes) => {
@@ -73,12 +76,15 @@ export class PgRustDatabase extends DurableObject {
     // A precompiled module is imported by Wrangler; no runtime compilation.
     const instance = new WebAssembly.Instance(postgres, { wasi_snapshot_preview1: host.wasi });
     host.setMemory(instance.exports.memory);
+    const instantiated = performance.now();
     let stats;
+    let engineFinished;
     this.ctx.storage.transactionSync(() => {
       try { instance.exports._start(); }
       catch (error) {
         if (!(error instanceof GuestExit && error.code === 0)) throw error;
       }
+      engineFinished = performance.now();
       stdout = decodeUtf8Chunks(outputChunks);
       stderr = decodeUtf8Chunks(diagnosticChunks);
       if (/\b(?:FATAL|PANIC):/.test(stderr)) throw new Error(stderr.slice(-4096));
@@ -91,7 +97,55 @@ export class PgRustDatabase extends DurableObject {
       diagnostics: stderr, bootId: this.bootId,
       memoryBytes: instance.exports.memory.buffer.byteLength,
       ...stats,
+      // Local workerd has advancing timers. Cloudflare freezes synchronous
+      // timers, so these stages are for local diagnosis, not live CPU claims.
+      localStageMs: {
+        metadata: metadataLoaded - started,
+        instantiate: instantiated - metadataLoaded,
+        engineAndFilesystem: engineFinished - instantiated,
+        flushAndFormat: performance.now() - engineFinished,
+      },
     };
+  }
+
+  prepareBenchmark() {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.initialize();
+      const result = this.execute(benchmarkSetup.join(';') + ';', false);
+      if (!result.ok) throw new Error(result.diagnostics);
+      this.ctx.storage.transactionSync(() => {
+        for (const sql of benchmarkSetup) this.ctx.storage.sql.exec(sql).toArray();
+      });
+      await this.ctx.storage.sync();
+      return { ok: true, rows: 1000, bootId: this.bootId };
+    });
+  }
+
+  benchmark(engine, scenario) {
+    if (!['pgrust', 'sqlite'].includes(engine) || !Object.hasOwn(benchmarkQueries, scenario)) throw new Error('Unknown benchmark');
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const started = performance.now();
+      const queries = benchmarkQueries[scenario];
+      let result;
+      if (engine === 'pgrust') {
+        result = this.execute(queries.join(';') + ';', false);
+        if (!result.ok) throw new Error(result.diagnostics);
+        result = { answers: [...result.raw.matchAll(/answer = "([0-9]+)"/g)].map(match => Number(match[1])),
+          localStageMs: result.localStageMs, filesystemOperations: result.filesystemOperations,
+          memoryBytes: result.memoryBytes };
+      } else {
+        const answers = [];
+        this.ctx.storage.transactionSync(() => {
+          for (const sql of queries) answers.push(...this.ctx.storage.sql.exec(sql).toArray().map(row => row.answer));
+        });
+        result = { answers, localStageMs: { nativeExecution: performance.now() - started } };
+      }
+      const executed = performance.now();
+      await this.ctx.storage.sync();
+      return { ok: true, engine, scenario, bootId: this.bootId, ...result,
+        localStageMs: { ...result.localStageMs, durability: performance.now() - executed },
+        elapsedMs: performance.now() - started };
+    });
   }
 
   status() {
@@ -118,7 +172,7 @@ export default {
     if (url.pathname === '/health') return Response.json({ ok: true, engine: 'pgrust-wasm', storage: 'durable-object-sqlite', experimental: true, buildCommit: env.BUILD_COMMIT || 'development' });
     if (url.pathname.startsWith('/api/')) {
       if (!await authorized(request, env)) return Response.json({ error: 'Test token required' }, { status: 401 });
-      const match = /^\/api\/db\/([a-z0-9-]{1,48})\/(query|status|restart)$/.exec(url.pathname);
+      const match = /^\/api\/db\/([a-z0-9-]{1,48})\/(query|status|restart|benchmark|benchmark-prepare)$/.exec(url.pathname);
       if (!match) return new Response('Not found', { status: 404 });
       const stub = env.DATABASES.getByName(match[1]);
       try {
@@ -128,9 +182,17 @@ export default {
           try { await stub.restart(); } catch { /* ctx.abort intentionally rejects the RPC */ }
           return Response.json({ restarted: true });
         }
+        if (match[2] === 'benchmark-prepare') return Response.json(await stub.prepareBenchmark());
         const body = await request.text();
         if (body.length > 16384) return Response.json({ error: 'SQL request limit is 16 KiB' }, { status: 413 });
         const input = JSON.parse(body);
+        if (match[2] === 'benchmark') {
+          const started = performance.now();
+          const result = await stub.benchmark(input.engine, input.scenario);
+          return Response.json({ ...result, rpcMs: performance.now() - started,
+            workerColo: request.cf?.colo || 'local', buildCommit: env.BUILD_COMMIT || 'development' },
+            { headers: { 'Cache-Control': 'no-store' } });
+        }
         if (typeof input.sql !== 'string' || !input.sql.trim()) return Response.json({ error: 'sql must be nonempty text' }, { status: 400 });
         const result = await stub.query(input.sql, input.failBeforeCommit === true);
         return Response.json(result, { headers: { 'Cache-Control': 'no-store' } });
