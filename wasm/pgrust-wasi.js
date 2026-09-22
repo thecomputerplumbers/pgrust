@@ -65,6 +65,36 @@ class Vfs {
     for (const p of [...this.nodes.keys()]) this._ensureAncestors(p);
   }
 
+  size(node) { return node.data.length; }
+  read(node, offset, length) { return node.data.subarray(offset, offset + length); }
+  truncate(node, size) {
+    if (size <= node.data.length) node.data = node.data.subarray(0, size);
+    else {
+      const data = new Uint8Array(size);
+      data.set(node.data);
+      node.data = data;
+      node.owned = true;
+    }
+    node.mtime = nowSec();
+  }
+  write(node, offset, bytes) {
+    const length = offset + bytes.length;
+    if (node.data.length < length) {
+      if (node.owned && node.data.buffer.byteLength - node.data.byteOffset >= length) {
+        const previous = node.data.length;
+        node.data = new Uint8Array(node.data.buffer, node.data.byteOffset, length);
+        node.data.fill(0, previous);
+      } else {
+        const data = new Uint8Array(Math.max(length, node.data.length * 2, 64));
+        data.set(node.data);
+        node.data = data.subarray(0, length);
+        node.owned = true;
+      }
+    }
+    node.data.set(bytes, offset);
+    node.mtime = nowSec();
+  }
+
   _norm(p) {
     p = String(p).replace(/\0+$/g, '');
     if (p === '' || p === '.') return '/';
@@ -240,7 +270,7 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
   }
   function writeFilestat(ptr, node) {
     const view = dv();
-    const size = node.type === 'file' ? node.data.length : 4096;
+    const size = node.type === 'file' ? vfs.size(node) : 4096;
     const mtimNs = BigInt(node.mtime || 0) * 1000000000n;
     view.setBigUint64(ptr + 0, 1n, true);                       // dev
     view.setBigUint64(ptr + 8, BigInt(node.ino || 1), true);    // ino
@@ -251,22 +281,6 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
     view.setBigUint64(ptr + 48, mtimNs, true);                  // mtim
     view.setBigUint64(ptr + 56, mtimNs, true);                  // ctim
   }
-  // grow() — extend a file to needLen bytes. Files start as subarrays of the
-  // packed image, whose bytes BEYOND len belong to other files — so capacity
-  // is only reused once the node owns a private buffer (node.owned). Doubling
-  // keeps repeated appends (WAL writes) from being O(n^2).
-  function grow(node, needLen) {
-    if (node.data.length >= needLen) return;
-    if (node.owned && node.data.buffer.byteLength - node.data.byteOffset >= needLen) {
-      node.data = new Uint8Array(node.data.buffer, node.data.byteOffset, needLen);
-      return;
-    }
-    const grown = new Uint8Array(Math.max(needLen, node.data.length * 2, 64));
-    grown.set(node.data);
-    node.data = grown.subarray(0, needLen);
-    node.owned = true;
-  }
-
   function* iovs(ptr, n) {
     const view = dv();
     for (let i = 0; i < n; i++) {
@@ -281,9 +295,8 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
     if (h.kind === 'pipewrite') { h.onWrite(bytes.slice()); return bytes.length; }
     if (h.kind !== 'file') return -E.BADF;
     const node = h.node;
-    const at = h.append ? node.data.length : h.pos;
-    grow(node, at + bytes.length);
-    node.data.set(bytes, at);
+    const at = h.append ? vfs.size(node) : h.pos;
+    vfs.write(node, at, bytes);
     h.pos = at + bytes.length;
     node.mtime = nowSec();
     return bytes.length;
@@ -395,8 +408,7 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
       if (!h || h.kind !== 'file') return E.BADF;
       size = num(size);
       const node = h.node;
-      if (size <= node.data.length) node.data = node.data.subarray(0, size);
-      else grow(node, size);
+      vfs.truncate(node, size);
       node.mtime = nowSec();
       return E.SUCCESS;
     },
@@ -414,7 +426,7 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
       let pos;
       if (whence === 0) pos = offset;                       // SET
       else if (whence === 1) pos = h.pos + offset;          // CUR
-      else if (whence === 2) pos = h.node.data.length + offset; // END
+      else if (whence === 2) pos = vfs.size(h.node) + offset; // END
       else return E.INVAL;
       if (pos < 0) return E.INVAL;
       h.pos = pos;
@@ -463,9 +475,9 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
           stdinPos += k;
         } else if (h.kind === 'file') {
           const node = h.node;
-          const k = Math.min(len, node.data.length - h.pos);
+          const k = Math.min(len, vfs.size(node) - h.pos);
           if (k <= 0) break;
-          chunk = node.data.subarray(h.pos, h.pos + k);
+          chunk = vfs.read(node, h.pos, k);
           h.pos += k;
         } else {
           return E.BADF;
@@ -486,9 +498,9 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
       const node = h.node;
       for (const { ptr, len } of iovs(iovsPtr, iovsLen)) {
         if (len === 0) continue;
-        const k = Math.min(len, Math.max(0, node.data.length - off));
+        const k = Math.min(len, Math.max(0, vfs.size(node) - off));
         if (k <= 0) break;
-        mem.set(node.data.subarray(off, off + k), ptr);
+        mem.set(vfs.read(node, off, k), ptr);
         off += k; total += k;
         if (k < len) break;
       }
@@ -518,8 +530,7 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
       let total = 0;
       for (const { ptr, len } of iovs(iovsPtr, iovsLen)) {
         if (len === 0) continue;
-        grow(node, off + len);
-        node.data.set(mem.subarray(ptr, ptr + len), off);
+        vfs.write(node, off, mem.subarray(ptr, ptr + len));
         off += len; total += len;
       }
       node.mtime = nowSec();
@@ -573,7 +584,7 @@ export function makeWasi({ image, manifest, vfs: existingVfs, stdinBytes, stdinS
         fds.set(fd, { kind: 'dir', path: vfs._norm(path), node });
       } else {
         if (oflags & OFLAG.DIRECTORY) return E.NOTDIR;
-        if (oflags & OFLAG.TRUNC) { node.data = new Uint8Array(0); node.mtime = nowSec(); }
+        if (oflags & OFLAG.TRUNC) { vfs.truncate(node, 0); }
         fd = nextFd++;
         fds.set(fd, {
           kind: 'file', path: vfs._norm(path), node,

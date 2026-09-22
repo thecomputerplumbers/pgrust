@@ -1,0 +1,143 @@
+import { DurableObject } from 'cloudflare:workers';
+import postgres from '../generated/postgres.wasm';
+import { makeWasi, GuestExit } from '../../wasm/pgrust-wasi.js';
+import { normalizeSingleUserInput, formatSingleUser, decodeUtf8Chunks } from '../../wasm/format.js';
+import { SqliteVfs, createSchema, seedMetadata, PAGE_SIZE } from './sqlite-vfs.js';
+
+const argv = ['postgres', '--single', '-D', '/pgdata',
+  '-c', 'max_stack_depth=60000', '-c', 'io_method=sync', '-c', 'autovacuum=off',
+  '-c', 'wal_sync_method=fdatasync', '-c', 'shared_buffers=1MB',
+  '-c', 'work_mem=1MB', '-c', 'maintenance_work_mem=1MB',
+  '-c', 'max_connections=4', '-c', 'max_worker_processes=0',
+  '-c', 'max_parallel_workers=0', '-c', 'statement_timeout=5000', 'postgres'];
+
+export class PgRustDatabase extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.bootId = crypto.randomUUID();
+    createSchema(ctx.storage.sql);
+  }
+
+  async initialize() {
+    const sql = this.ctx.storage.sql;
+    if (sql.exec("SELECT value FROM settings WHERE key = 'ready'").toArray().length) return;
+    const get = async (name) => {
+      const r = await this.env.ASSETS.fetch(new Request(`https://seed.invalid/seed/${name}`));
+      if (!r.ok) throw new Error(`Seed asset unavailable: ${name}`);
+      return r;
+    };
+    const manifest = await (await get('manifest.json')).json();
+    for (let index = 0; index < manifest.chunks.length; index++) {
+      const data = new Uint8Array(await (await get(manifest.chunks[index])).arrayBuffer());
+      this.ctx.storage.transactionSync(() => {
+        for (let off = 0; off < data.length; off += PAGE_SIZE) {
+          const page = data.subarray(off, off + PAGE_SIZE);
+          // Sparse pages are implicitly zero. The seed contains a mostly empty WAL.
+          if (page.some(byte => byte !== 0)) {
+            sql.exec('INSERT OR REPLACE INTO seed_pages (page, data) VALUES (?, ?)',
+              index * (1048576 / PAGE_SIZE) + off / PAGE_SIZE, page);
+          }
+        }
+      });
+    }
+    this.ctx.storage.transactionSync(() => {
+      seedMetadata(sql, manifest);
+      sql.exec("INSERT INTO settings (key, value) VALUES ('ready', '1')");
+    });
+    await this.ctx.storage.sync();
+  }
+
+  async query(input, failBeforeCommit = false) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.initialize();
+      const started = performance.now();
+      const vfs = new SqliteVfs(this.ctx.storage.sql);
+      const outputChunks = [], diagnosticChunks = [];
+      let stdout = '', stderr = '', outputBytes = 0;
+      const sink = (kind) => (bytes) => {
+        outputBytes += bytes.length;
+        if (outputBytes > 131072) throw new Error('Query output exceeds 128 KiB limit');
+        (kind === 'out' ? outputChunks : diagnosticChunks).push(bytes);
+      };
+      const host = makeWasi({ vfs, argv, stdinBytes: normalizeSingleUserInput(input),
+        onStdout: sink('out'), onStderr: sink('err') });
+      // A precompiled module is imported by Wrangler; no runtime compilation.
+      const instance = new WebAssembly.Instance(postgres, { wasi_snapshot_preview1: host.wasi });
+      host.setMemory(instance.exports.memory);
+      let stats;
+      this.ctx.storage.transactionSync(() => {
+        try { instance.exports._start(); }
+        catch (error) {
+          if (!(error instanceof GuestExit && error.code === 0)) throw error;
+        }
+        stdout = decodeUtf8Chunks(outputChunks);
+        stderr = decodeUtf8Chunks(diagnosticChunks);
+        if (/\b(?:FATAL|PANIC):/.test(stderr)) throw new Error(stderr.slice(-4096));
+        stats = vfs.flush();
+        if (failBeforeCommit) throw new Error('Injected failure before durable commit');
+      });
+      // Do not acknowledge results before the DO storage commit is durable.
+      await this.ctx.storage.sync();
+      return {
+        ok: !/\bERROR:/.test(stderr), output: stdout.split(/^backend> /m)
+          .filter(part => part.includes('(typeid =')).map(formatSingleUser).join('\n\n'), raw: stdout,
+        diagnostics: stderr, bootId: this.bootId,
+        memoryBytes: instance.exports.memory.buffer.byteLength,
+        elapsedMs: Math.round((performance.now() - started) * 100) / 100,
+        ...stats,
+      };
+    });
+  }
+
+  status() {
+    return { bootId: this.bootId, initialized: this.ctx.storage.sql.exec("SELECT value FROM settings WHERE key = 'ready'").toArray().length > 0 };
+  }
+
+  restart() { this.ctx.abort('Explicit test restart: durable data retained'); }
+}
+
+async function authorized(request, env) {
+  if (!env.TEST_TOKEN) return false;
+  const supplied = request.headers.get('Authorization') || '';
+  const encode = new TextEncoder();
+  const a = new Uint8Array(await crypto.subtle.digest('SHA-256', encode.encode(supplied)));
+  const b = new Uint8Array(await crypto.subtle.digest('SHA-256', encode.encode(`Bearer ${env.TEST_TOKEN}`)));
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === '/health') return Response.json({ ok: true, engine: 'pgrust-wasm', storage: 'durable-object-sqlite', experimental: true, buildCommit: env.BUILD_COMMIT || 'development' });
+    if (url.pathname.startsWith('/api/')) {
+      if (!await authorized(request, env)) return Response.json({ error: 'Test token required' }, { status: 401 });
+      const match = /^\/api\/db\/([a-z0-9-]{1,48})\/(query|status|restart)$/.exec(url.pathname);
+      if (!match) return new Response('Not found', { status: 404 });
+      const stub = env.DATABASES.getByName(match[1]);
+      try {
+        if (match[2] === 'status' && request.method === 'GET') return Response.json(await stub.status());
+        if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+        if (match[2] === 'restart') {
+          try { await stub.restart(); } catch { /* ctx.abort intentionally rejects the RPC */ }
+          return Response.json({ restarted: true });
+        }
+        const body = await request.text();
+        if (body.length > 16384) return Response.json({ error: 'SQL request limit is 16 KiB' }, { status: 413 });
+        const input = JSON.parse(body);
+        if (typeof input.sql !== 'string' || !input.sql.trim()) return Response.json({ error: 'sql must be nonempty text' }, { status: 400 });
+        const result = await stub.query(input.sql, input.failBeforeCommit === true);
+        return Response.json(result, { headers: { 'Cache-Control': 'no-store' } });
+      } catch (error) {
+        return Response.json({ error: error.message }, { status: 500 });
+      }
+    }
+    if (!['/', '/index.html', '/app.js', '/style.css'].includes(url.pathname)) return new Response('Not found', { status: 404 });
+    const response = await env.ASSETS.fetch(request);
+    const headers = new Headers(response.headers);
+    headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'");
+    headers.set('Referrer-Policy', 'no-referrer');
+    return new Response(response.body, { status: response.status, headers });
+  }
+};

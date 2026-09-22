@@ -1,0 +1,13 @@
+{
+  "name": "pgrust-durable-object-experiment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare:assets": "node scripts/prepare-assets.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": { "wrangler": "4.135.0" }
+}

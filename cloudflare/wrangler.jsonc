@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pgrust-do-test",
+  "account_id": "865d0c927a18e87c0a0701b8d1f18ee9",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-21",
+  "workers_dev": false,
+  "routes": [{ "pattern": "pgrust.thecomputerplumbers.com", "custom_domain": true }],
+  "preview_urls": false,
+  "assets": { "directory": "public", "binding": "ASSETS", "run_worker_first": true },
+  "durable_objects": { "bindings": [{ "name": "DATABASES", "class_name": "PgRustDatabase" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PgRustDatabase"] }],
+  "observability": { "enabled": true },
+  "limits": { "cpu_ms": 30000 }
+}
